@@ -12,13 +12,6 @@ runtime/tools/
 tools/bin/
 config/credentials.ini
 .claude/settings.local.json
-.claude/
 .idea/
-.opencli-tmp/
 gh-cli/
-*.xlsx
-*.json
-*.csv
-*.log
-*.txt
 src/*.egg-info/
