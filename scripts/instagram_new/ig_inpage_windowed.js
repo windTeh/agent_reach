@@ -1,6 +1,6 @@
 // Meta Business Suite 帖子表格：按自定义日期窗口递归拆分，避免每页 50 条截断。
-// 仅过滤非 Instagram 帖子；保留页面结果中的所有 IG_POST，不按 owner_id 过滤。
-// 这样可完整保留 Published posts 表格返回的 Instagram 记录，并仍排除 Facebook 节点。
+// 仅过滤非 Instagram 帖子；保留页面结果中的所有 IG_POST 与 IG_STORY，不按 owner_id 过滤。
+// 这样可完整保留 Published posts 表格返回的 Instagram 记录（含 Story），并仍排除 Facebook 节点。
 (() => {
   const CONFIG = { from: __START_DATE__, to: __END_DATE__, assetId: __ASSET_ID__, count: 50, maxDepth: 16 };
   const day = 86400000;
@@ -30,6 +30,9 @@
     const ownerId = String(ownerInfo.id || '').replace(/^GraphQLTofuIGAccountEntityInfo:/, '');
     // 账号用户名以接口返回值为准，而非脚本配置里的账号名。
     const ownerUsername = ownerInfo.username || ownerInfo.name || ownerInfo.title || '';
+    // 帖子媒体类型（clips/feed/carousel_container 等）与视频时长，用于 Doris post_type / duration 列。
+    const mediaProductType = info.post_type || '';
+    const videoDurationSec = info.video_duration_in_sec != null ? info.video_duration_in_sec : null;
     const keys = ['views', 'reach', 'interactions', 'net_reactions', 'net_comments', 'shares', 'net_saves', 'link_clicks', 'replies', 'new_follows', 'video_play_time', 'video_average_play_time', 'video_three_second_views', 'instream_ads_estimated_earnings'];
     const metrics = {}; keys.forEach(key => metrics[key] = cell(fields[key]));
     // Published posts 的跨发布关系在不同 Meta 页面版本可能挂在 node/header/entity/
@@ -59,10 +62,12 @@
     return {
       row_id: node.row_id, entity_type: entity.entity_type, owner_id: ownerId, owner_username: ownerUsername,
       title: info.title || '', created_at: info.created_at || null,
+      media_product_type: mediaProductType, video_duration_in_sec: videoDurationSec,
       cross_posts: crossPosts,
-      // 仅当关系中出现 FB Page Post 等另一平台的实际对象时，才是真正的交叉发布。
-      // __isTofuCrossPostedContentInfo 是 Meta 通用接口标记，不能单独作为判定条件。
-      is_cross_post: crossPosts.some(item => item.entity_type && item.entity_type !== 'IG_POST'),
+      // 仅 IG_POST 且关联中出现 Facebook 平台实体（FB_PAGE_POST 等）时才判定为跨发布，
+      // 因为 Meta 对跨发布的 IG_POST 在 Content 表格返回 FB+IG 合并值，需进 object_insights 取 IG 单独值。
+      // IG_STORY 在 Content 表格返回的已是 IG 单独值（无需 object_insights），故一律不判跨发布。
+      is_cross_post: entity.entity_type === 'IG_POST' && crossPosts.some(item => item.entity_type && item.entity_type.indexOf('FB_') === 0),
       entity_keys: Object.keys(entity), entity_info_keys: Object.keys(info), owner_info_keys: Object.keys(ownerInfo), owner_title: ownerInfo.title || '', metrics
     };
   };
@@ -109,7 +114,7 @@
       if (truncated) report.errors.push('窗口仍截断: ' + from + '~' + to + ' (' + result.edges.length + '/' + result.total + ')');
       result.edges.forEach(edge => {
         const row = extract(edge.node || {});
-        if (row.entity_type !== 'IG_POST') { report.rejected++; return; }
+        if (row.entity_type !== 'IG_POST' && row.entity_type !== 'IG_STORY') { report.rejected++; return; }
         if (row.row_id && !seen.has(row.row_id)) { seen.add(row.row_id); rows.push(row); }
       });
       window.__igPostsProgress.rows = rows.length; window.__igPostsProgress.rejected = report.rejected;

@@ -1,39 +1,57 @@
 # -*- coding: utf-8 -*-
 """通过 Agent Reach 项目内 OpenCLI 抓取 Meta Business Suite 的 Instagram 帖子洞察。
 
-数据源是已登录的 Meta Business Suite 的 Published posts 页面；每个账号以其
-Instagram asset_id 单独发起 Content GraphQL 查询，并保留响应中的所有 entity_type=IG_POST
-记录，不按 owner_id 过滤；Facebook 节点仍会被排除。跨发布帖另行进入 object_insights 获取 IG 专属指标。
+数据源是已登录的 Meta Business Suite 的 insights/content 页面；每个账号以其
+Instagram asset_id 单独发起统一表格 GraphQL 查询（callerID=BIZWEB_INSIGHTS_ORGANIC_CONTENT），
+该查询同时返回 IG_POST 与 IG_STORY。不按 owner_id 过滤；Facebook 节点仍会被排除。
+跨发布的 IG_POST 另行进入 object_insights 获取 IG 专属指标。
 
 示例：
   E:\\CCProject\\agent_reach\\.agent-reach-venv\\Scripts\\python.exe fetch_instagram_posts.py ^
     --start-date 2026-08-01 --end-date 2026-08-07
 """
 import argparse
-import csv
+import base64
+import configparser
 import json
 import subprocess
 import sys
 import time
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from urllib.request import Request, urlopen
 
 BASE = Path(__file__).resolve().parent
 WINDOWED_JS = BASE / "ig_inpage_windowed.js"
 NODE = r"C:\Users\zhengjingyi\.workbuddy\binaries\node\versions\22.22.2-2\node.exe"
 OPENCLI_JS = r"E:\CCProject\agent_reach\.opencli-tmp\node_modules\@jackwener\opencli\dist\src\main.js"
+DORIS_CONFIG = Path(__file__).resolve().parents[2] / "config" / "credentials.ini"
 
 ACCOUNTS = (
     {"username": "anycubicofficial", "asset_id": "17841406045865168", "business_id": "800253393765350", "timezone": "America/Los_Angeles"},
     {"username": "anycubic_deutschland", "asset_id": "17841414725872019", "business_id": "761831987530602", "timezone": "Europe/Berlin"},
 )
-COLUMNS = [
-    "date", "post_id", "account_id", "account_username", "title", "publish_time",
-    "views", "reach", "interactions", "likes_reactions", "comments", "shares", "saves",
-    "link_clicks", "replies", "new_follows", "video_play_time_min", "avg_play_time_sec",
-    "video_3s_views", "instream_ads_earnings", "etl_date",
+
+# Doris 目标表 ods_instagram_post_insights 的列顺序（与 scripts/ins/fetch_fb_insights.py 一致）。
+DORIS_COLUMNS = [
+    "date", "post_id", "post_type", "account_username", "account_name", "duration", "account_id",
+    "title", "publish_time", "permalink",
+    "views", "reach", "viewers", "interactions", "likes_reactions", "comments", "shares",
+    "saves", "link_clicks", "replies", "new_follows", "video_play_time_min",
+    "avg_play_time_sec", "video_3s_views", "instream_ads_earnings",
+    "etl_date",
 ]
+
+TYPE_NAMES = {"IG_STORY": "IG story", "IG_POST": "IG post", "FB_PAGE_POST": "FB Page Post"}
+MEDIA_TYPE_NAMES = {1: "IG image", 2: "IG reel", 8: "IG carousel"}
+MEDIA_PRODUCT_TYPE_NAMES = {
+    "clips": "IG reel", "feed": "IG image", "story": "IG story",
+    "stories": "IG story", "carousel_container": "IG carousel", "igtv": "IGTV",
+    "feed_video": "IG reel", "reels": "IG reel",
+}
 
 
 def run(command, timeout=120):
@@ -55,7 +73,7 @@ def evaluate(session, javascript, timeout=120):
 
 
 def page_url(account):
-    return "https://business.facebook.com/latest/posts/published_posts/?business_id={}&asset_id={}".format(account["business_id"], account["asset_id"])
+    return "https://business.facebook.com/latest/insights/content/?business_id={}&asset_id={}".format(account["business_id"], account["asset_id"])
 
 
 def wait_for_page(session, account, seconds=90):
@@ -284,27 +302,6 @@ def enrich_cross_post_metrics(session, account, rows):
         print("    [{}/{}] {}: views={}，likes_reactions={}".format(index, len(cross_rows), row["row_id"], metrics.get("views"), metrics.get("net_reactions")))
 
 
-def account_timezone(timezone_name):
-    try:
-        return ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError:
-        # Windows 的项目 Python 未安装 tzdata 时仍保持可运行；该回退仅影响夏令时边界日。
-        offsets = {"America/Los_Angeles": -7, "Europe/Berlin": 2}
-        return timezone(timedelta(hours=offsets.get(timezone_name, 0)))
-
-
-def format_publish_time(epoch, timezone_name):
-    if not epoch:
-        return ""
-    return datetime.fromtimestamp(float(epoch), timezone.utc).astimezone(account_timezone(timezone_name)).strftime("%Y-%m-%d %H:%M:%S%z")
-
-
-def local_date(epoch, timezone_name):
-    if not epoch:
-        return ""
-    return datetime.fromtimestamp(float(epoch), timezone.utc).astimezone(account_timezone(timezone_name)).date().isoformat()
-
-
 def value(metrics, key, divisor=1):
     raw = metrics.get(key)
     if raw in (None, ""):
@@ -315,29 +312,128 @@ def value(metrics, key, divisor=1):
         return 0
 
 
-def to_export_row(raw, account, etl_date):
+def map_post_type(source_row):
+    """细分帖子类型：IG reel / IG image / IG carousel / IG story 等。"""
+    mpt = source_row.get("media_product_type")
+    if mpt:
+        mapped = MEDIA_PRODUCT_TYPE_NAMES.get(str(mpt).lower())
+        if mapped:
+            return mapped
+    entity_type = source_row.get("entity_type")
+    if entity_type == "IG_STORY":
+        return "IG story"
+    if entity_type == "IG_POST":
+        media_type = source_row.get("media_type")
+        if media_type is not None:
+            try:
+                media_type = int(media_type)
+            except (TypeError, ValueError):
+                pass
+            mapped = MEDIA_TYPE_NAMES.get(media_type)
+            if mapped:
+                return mapped
+        metrics = source_row.get("metrics") or {}
+        if metrics.get("video_play_time"):
+            return "IG reel"
+        return "IG image"
+    return TYPE_NAMES.get(entity_type, entity_type or "")
+
+
+def account_timezone(timezone_name):
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        # 项目 Python 未安装 tzdata 时保持可运行；该回退仅影响夏令时边界日。
+        offsets = {"America/Los_Angeles": -7, "Europe/Berlin": 2}
+        return timezone(timedelta(hours=offsets.get(timezone_name, 0)))
+
+
+def format_publish_time(epoch, timezone_name):
+    """按账号业务时区格式化发布时间，保留时区偏移（如 2026-03-31 18:02:50+0200）。"""
+    if not epoch:
+        return ""
+    return datetime.fromtimestamp(float(epoch), timezone.utc).astimezone(account_timezone(timezone_name)).strftime("%Y-%m-%d %H:%M:%S%z")
+
+
+def to_doris_row(raw, account, etl_date):
+    """Map one Published posts row to the Doris target schema (ods_instagram_post_insights)."""
     metrics = raw.get("metrics") or {}
-    # account_username 优先取接口返回值，缺失时回退到脚本配置的账号名。
+    created_at = raw.get("created_at")
+    publish_time = format_publish_time(created_at, account["timezone"])
+    duration_ms = raw.get("video_duration_in_sec")
+    try:
+        duration_ms = int(round(float(duration_ms) * 1000)) if duration_ms not in (None, "") else 0
+    except (TypeError, ValueError):
+        duration_ms = 0
+    # account_id / account_username 均取接口返回值，缺失时回退脚本配置。
     username = raw.get("owner_username") or account["username"]
+    account_id = raw.get("owner_id") or account["asset_id"]
     return {
-        "date": local_date(raw.get("created_at"), account["timezone"]),
-        "post_id": raw.get("row_id", ""), "account_id": account["asset_id"], "account_username": username,
-        "title": (raw.get("title") or "").replace("\r", " ").replace("\n", " ").strip(), "publish_time": format_publish_time(raw.get("created_at"), account["timezone"]),
-        "views": value(metrics, "views"), "reach": value(metrics, "reach"), "interactions": value(metrics, "interactions"),
-        "likes_reactions": value(metrics, "net_reactions"), "comments": value(metrics, "net_comments"), "shares": value(metrics, "shares"),
-        "saves": value(metrics, "net_saves"), "link_clicks": value(metrics, "link_clicks"), "replies": value(metrics, "replies"),
-        "new_follows": value(metrics, "new_follows"), "video_play_time_min": value(metrics, "video_play_time", 60000),
-        "avg_play_time_sec": value(metrics, "video_average_play_time", 1000), "video_3s_views": value(metrics, "video_three_second_views"),
-        "instream_ads_earnings": value(metrics, "instream_ads_estimated_earnings", 100), "etl_date": etl_date,
+        "date": etl_date,
+        "post_id": raw.get("row_id", ""),
+        "post_type": map_post_type(raw),
+        "account_username": username,
+        "account_name": "",
+        "duration": duration_ms,
+        "account_id": account_id,
+        "title": (raw.get("title") or "").replace("\r", " ").replace("\n", " ").strip(),
+        "publish_time": publish_time,
+        "permalink": raw.get("permalink") or "",
+        "views": value(metrics, "views"), "reach": value(metrics, "reach"), "viewers": value(metrics, "viewers"),
+        "interactions": value(metrics, "interactions"),
+        "likes_reactions": value(metrics, "net_reactions"), "comments": value(metrics, "net_comments"),
+        "shares": value(metrics, "shares"), "saves": value(metrics, "net_saves"),
+        "link_clicks": value(metrics, "link_clicks"), "replies": value(metrics, "replies"),
+        "new_follows": value(metrics, "new_follows"),
+        "video_play_time_min": value(metrics, "video_play_time", 60000),
+        "avg_play_time_sec": value(metrics, "video_average_play_time", 1000),
+        "video_3s_views": value(metrics, "video_three_second_views"),
+        "instream_ads_earnings": value(metrics, "instream_ads_estimated_earnings", 100),
+        "etl_date": etl_date,
     }
 
 
-def write_csv(rows, output):
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", encoding="utf-8-sig", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
+def load_doris_config(config_path):
+    parser = configparser.ConfigParser()
+    if not parser.read(config_path, encoding="utf-8") or not parser.has_section("doris"):
+        raise ValueError("missing [doris] configuration in %s" % config_path)
+    required = ("host", "be_port", "user", "password")
+    missing = [key for key in required if not parser.get("doris", key, fallback="").strip()]
+    if missing:
+        raise ValueError("missing Doris configuration: %s" % ", ".join(missing))
+    return {key: parser.get("doris", key).strip() for key in required}
+
+
+def stream_load_rows(rows, config_path):
+    """Write insight rows to Doris table ods_instagram_post_insights using NDJSON Stream Load."""
+    if not rows:
+        return {"Status": "Success", "NumberLoadedRows": 0, "Label": ""}
+    config = load_doris_config(config_path)
+    url = ("http://%s:%s/api/ods_social_media/ods_instagram_post_insights/_stream_load"
+           % (config["host"], config["be_port"]))
+    payload = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows).encode("utf-8")
+    credentials = ("%s:%s" % (config["user"], config["password"])).encode("utf-8")
+    request = Request(url, data=payload, method="PUT")
+    request.add_header("Content-Type", "application/json")
+    request.add_header("Authorization", "Basic " + base64.b64encode(credentials).decode("ascii"))
+    request.add_header("format", "json")
+    request.add_header("read_json_by_line", "true")
+    request.add_header("columns", ",".join(DORIS_COLUMNS))
+    request.add_header("label", "instagram_post_insights_" + uuid.uuid4().hex)
+    try:
+        with urlopen(request, timeout=120) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError("Doris Stream Load HTTP %s: %s" % (exc.code, body)) from exc
+    except (URLError, OSError) as exc:
+        raise RuntimeError("Doris Stream Load request failed: %s" % exc) from exc
+    if result.get("Status") != "Success":
+        raise RuntimeError("Doris Stream Load failed: %s" % result.get("Message", result))
+    loaded_rows = int(result.get("NumberLoadedRows", 0))
+    if loaded_rows != len(rows):
+        raise RuntimeError("Doris Stream Load loaded %s of %s rows" % (loaded_rows, len(rows)))
+    return result
 
 
 def parse_dates(args):
@@ -352,24 +448,20 @@ def parse_dates(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="通过 Agent Reach 抓取两个 Instagram 账号的帖子级洞察")
+    parser = argparse.ArgumentParser(description="通过 Agent Reach 抓取两个 Instagram 账号的帖子级洞察并写入 Doris")
     parser.add_argument("--start-date", required=True, help="包含边界，YYYY-MM-DD")
     parser.add_argument("--end-date", required=True, help="包含边界，YYYY-MM-DD")
     parser.add_argument("--session", default="dqg7tk9s", help="项目已连接的 OpenCLI 浏览器 session")
     parser.add_argument("--accounts", default="anycubicofficial,anycubic_deutschland", help="可选账号列表")
-    parser.add_argument("--output", default=None, help="CSV 输出路径")
-    parser.add_argument("--raw-output", default=None, help="原始 JSON 输出路径，用于审计")
+    parser.add_argument("--doris-config", default=str(DORIS_CONFIG), help="Doris 连接配置路径（credentials.ini）")
     args = parser.parse_args()
     start_date, end_date = parse_dates(args)
     selected = {x.strip() for x in args.accounts.split(",") if x.strip()}
     accounts = [a for a in ACCOUNTS if a["username"] in selected]
     if not accounts or len(accounts) != len(selected):
         raise SystemExit("--accounts 仅支持: {}".format(", ".join(a["username"] for a in ACCOUNTS)))
-    stamp = "{}_{}".format(start_date.replace("-", ""), end_date.replace("-", ""))
-    output = Path(args.output) if args.output else BASE / "output" / "instagram_posts_{}.csv".format(stamp)
-    raw_output = Path(args.raw_output) if args.raw_output else BASE / "output" / "instagram_posts_{}_raw.json".format(stamp)
     etl_date = date.today().isoformat()
-    all_export, all_raw, failures = [], {}, []
+    all_doris_rows, failures = [], []
     for account in accounts:
         print("\n=== @{} | asset_id={} | business_id={} ===".format(account["username"], account["asset_id"], account["business_id"]))
         try:
@@ -384,18 +476,24 @@ def main():
             wait_for_fetch(args.session)
             rows, report = read_rows(args.session)
             enrich_cross_post_metrics(args.session, account, rows)
-            all_raw[account["username"]] = {"account": account, "report": report, "rows": rows}
-            all_export.extend(to_export_row(row, account, etl_date) for row in rows)
-            print("  完成：{} 条 IG 帖子，GraphQL 请求 {} 次，拒绝 {} 条非 IG 记录".format(len(rows), report.get("requests", 0), report.get("rejected", 0)))
+            account_doris_rows = [to_doris_row(row, account, etl_date) for row in rows]
+            all_doris_rows.extend(account_doris_rows)
+            print("  完成：{} 条 IG 帖子/Story，GraphQL 请求 {} 次，拒绝 {} 条非 IG 记录".format(len(rows), report.get("requests", 0), report.get("rejected", 0)))
         except Exception as error:
             failures.append("{}: {}".format(account["username"], error))
             print("ERROR: {}".format(failures[-1]), file=sys.stderr)
-    all_export.sort(key=lambda row: (row["account_username"], row["publish_time"]), reverse=True)
-    write_csv(all_export, output)
-    raw_output.parent.mkdir(parents=True, exist_ok=True)
-    raw_output.write_text(json.dumps(all_raw, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("\n已导出 {} 行: {}".format(len(all_export), output))
-    print("原始审计数据: {}".format(raw_output))
+            continue
+
+    loaded_total = 0
+    if all_doris_rows:
+        all_doris_rows.sort(key=lambda row: (row["account_username"], row["publish_time"]), reverse=True)
+        result = stream_load_rows(all_doris_rows, Path(args.doris_config))
+        loaded_total = int(result.get("NumberLoadedRows", 0))
+        print("\n已写入 Doris(ods_instagram_post_insights): {} 行，filtered={}，unselected={}".format(
+            loaded_total, result.get("NumberFilteredRows", 0), result.get("NumberUnselectedRows", 0)))
+    else:
+        print("\n无数据可写入 Doris")
+
     if failures:
         print("失败账号：\n- " + "\n- ".join(failures), file=sys.stderr)
         return 1
