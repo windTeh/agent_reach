@@ -4,7 +4,14 @@
 数据源是已登录的 Meta Business Suite 的 insights/content 页面；每个账号以其
 Instagram asset_id 单独发起统一表格 GraphQL 查询（callerID=BIZWEB_INSIGHTS_ORGANIC_CONTENT），
 该查询同时返回 IG_POST 与 IG_STORY。不按 owner_id 过滤；Facebook 节点仍会被排除。
-跨发布的 IG_POST 另行进入 object_insights 获取 IG 专属指标。
+
+跨发布的 IG_POST 在统一表格里返回的是 FB+IG 合并值，需要单独取 Instagram 平台值。
+本脚本不打开 object_insights 页面，而是直接调用该页面背后的 GraphQL
+（callerID=BIZWEB_OBJECT_INSIGHTS），在 content 页面上下文里发同源请求：
+  - TofuObjectInsightsV2EntityQuery  一次返回该实体的全部指标；
+    entity_insights 中不带 foa_ 前缀的字段即 Instagram 单独值，foa_ 前缀为 FB+IG 合并值。
+  - useBizWebInsightsSingleValueQuery 补取 Instagram 侧的 Follows。
+会话参数（fb_dtsg/lsd/__rev/c_user）从当前页面提取，无需预先捕获请求模板。
 
 示例：
   E:\\CCProject\\agent_reach\\.agent-reach-venv\\Scripts\\python.exe fetch_instagram_posts.py ^
@@ -26,6 +33,12 @@ from urllib.request import Request, urlopen
 
 BASE = Path(__file__).resolve().parent
 WINDOWED_JS = BASE / "ig_inpage_windowed.js"
+OBJECT_INSIGHTS_JS = BASE / "ig_object_insights.js"
+
+# object_insights 背后的 GraphQL，callerID 均为 BIZWEB_OBJECT_INSIGHTS。
+# doc_id 会随 Meta 前端版本更新，若调用报错可重新捕获一次页面请求再替换。
+OI_ENTITY_DOC_ID = "28252130357723267"   # TofuObjectInsightsV2EntityQuery：一次返回实体全部指标
+OI_SINGLE_DOC_ID = "31321294414185827"   # useBizWebInsightsSingleValueQuery：单指标，用于补 Follows
 NODE = r"C:\Users\zhengjingyi\.workbuddy\binaries\node\versions\22.22.2-2\node.exe"
 OPENCLI_JS = r"E:\CCProject\agent_reach\.opencli-tmp\node_modules\@jackwener\opencli\dist\src\main.js"
 DORIS_CONFIG = Path(__file__).resolve().parents[2] / "config" / "credentials.ini"
@@ -184,102 +197,58 @@ def read_rows(session):
     return data["rows"], data["report"]
 
 
-def fetch_cross_post_ig_metrics(session, account, post_id):
-    """从 object_insights 的 Instagram 标签读取跨发帖的 IG 专属指标。
+def fetch_ig_only_metrics(session, post_id, timeout=180):
+    """不打开 object_insights，直接调用其背后的 GraphQL 取 Instagram 单独指标。
 
-    Content 表格对跨发帖返回 FB+IG 合并值；object_insights 在 Instagram 标签
-    展示同一 IG 对象的专属数值，因此以该页面返回值覆盖合并值。
+    统一表格（BIZWEB_INSIGHTS_ORGANIC_CONTENT）对跨发布帖返回 FB+IG 合并值，且
+    响应里不含平台拆分字段。object_insights 页面自身也是调 BIZWEB_OBJECT_INSIGHTS
+    的 TofuObjectInsightsV2EntityQuery 取数，其中 entity_insights 里不带 foa_ 前缀的
+    字段就是 Instagram 单独值（带 foa_ 前缀的是 FB+IG 合并值）。该请求可在 content
+    页面上下文直接发起（同源 + 页面会话参数），无需任何页面导航或请求模板捕获。
+
+    返回 (ig_metrics, diagnostics)：
+      - ig_metrics：包含 IG 单值的 dict（含 None 表示该指标业务无数据）；
+      - diagnostics：包含 ok / views_unavailable / got_keys / got_count 等。
+    调用方需根据 diagnostics.ok 决定是否走回退路径。
     """
-    url = (
-        "https://business.facebook.com/latest/insights/object_insights/"
-        "?asset_id={}&business_id={}&content_id={}&nav_ref=bizweb_insights_uta_table"
-    ).format(account["asset_id"], account["business_id"], post_id)
-    out, err, rc = browser(session, "open", url, timeout=120)
+    js = OBJECT_INSIGHTS_JS.read_text(encoding="utf-8")
+    js = (js.replace("__POST_ID__", json.dumps(post_id))
+            .replace("__ENTITY_DOC__", json.dumps(OI_ENTITY_DOC_ID))
+            .replace("__SINGLE_DOC__", json.dumps(OI_SINGLE_DOC_ID)))
+    out, err, rc = evaluate(session, js, timeout=timeout)
     if rc:
-        raise RuntimeError("打开跨发帖 IG 洞察页失败: {}".format(err or out))
-    # Total performance 页的 Views 分拆会给出精确的 "N from Instagram"；Instagram
-    # 标签仅显示缩写（如 46.3K），所以先读取该精确 IG 分项，再切换标签读取其余指标。
-    exact_views_js = r'''(() => {
-      const text = (document.body && document.body.innerText) || '';
-      const match = text.match(/([\d,]+)\s+from Instagram/i);
-      return JSON.stringify({views: match ? Number(match[1].replace(/,/g, '')) : null});
-    })()'''
-
-    def read_exact_views():
-        out, err, rc = evaluate(session, exact_views_js, timeout=45)
-        if rc:
-            raise RuntimeError("读取跨发帖 Instagram 精确 Views 失败: {}".format(err or out))
-        return json.loads(out).get("views")
-
-    exact_views = read_exact_views()
-    # Published posts 已明确判定为跨发布，但 object_insights 有时会延迟加载平台分拆。
-    # 首次未出现时，每隔 30 秒刷新页面并再尝试，最多重试 3 次（共 4 次读取）。
-    for retry in range(1, 4):
-        if exact_views is not None:
-            break
-        print("      {}: 未找到 Instagram 分拆，30 秒后刷新第 {}/3 次...".format(post_id, retry), flush=True)
-        time.sleep(30)
-        out, err, rc = browser(session, "open", url, timeout=120)
-        if rc:
-            raise RuntimeError("刷新跨发帖 IG 洞察页失败: {}".format(err or out))
-        exact_views = read_exact_views()
-
-    # 三次刷新后依旧没有 Instagram 分拆，无法可靠覆写合并值；按约定回退
-    # Published posts 的 Content 表格指标，而不是清空或中断账号处理。
-    if exact_views is None:
-        print("      {}: 重试 3 次仍未找到 Instagram 分拆，回退 Content 表格指标".format(post_id), file=sys.stderr, flush=True)
-        return None
-    switch_js = r'''(async () => {
-      const deadline = Date.now() + 60000;
-      while (Date.now() < deadline) {
-        const choices = Array.from(document.querySelectorAll('[role=tab],div,span,button')).filter(x =>
-          (x.innerText || '').trim() === 'Instagram' && !Array.from(x.children).some(c => (c.innerText || '').trim() === 'Instagram'));
-        if (choices.length) { choices[0].click(); await new Promise(r => setTimeout(r, 2500)); return 'switched'; }
-        await new Promise(r => setTimeout(r, 500));
-      }
-      return 'Instagram tab not found';
-    })()'''
-    out, err, rc = evaluate(session, switch_js, timeout=90)
-    if rc or "switched" not in out:
-        raise RuntimeError("切换跨发帖到 Instagram 标签失败: {}".format(err or out))
-    extract_js = r'''(() => {
-      const text = (document.body && document.body.innerText) || '';
-      const number = raw => {
-        const s = String(raw || '').replace(/,/g, '').trim();
-        const m = s.match(/^([0-9]+(?:\.[0-9]+)?)([KM])?$/i);
-        if (!m) return null;
-        const base = Number(m[1]); return m[2] && m[2].toUpperCase() === 'K' ? Math.round(base * 1000) : (m[2] ? Math.round(base * 1000000) : base);
-      };
-      const afterLabel = label => {
-        const index = text.indexOf(label); if (index < 0) return null;
-        const tail = text.slice(index + label.length, index + label.length + 120);
-        const values = tail.split(/\n+/).map(x => x.trim()).filter(Boolean);
-        return number(values.find(x => /^\d[\d,.]*[KM]?$/i.test(x)));
-      };
-      const totalMatch = text.match(/Views\s*\n\s*[\u200B\s]*\n\s*([\d,.]+[KM]?)/i) || text.match(/Views\s*\n\s*([\d,.]+[KM]?)/i);
-      return JSON.stringify({
-        views: totalMatch ? number(totalMatch[1]) : null,
-        reach: afterLabel('Reach'), interactions: afterLabel('Interactions'),
-        net_reactions: afterLabel('Likes and reactions'), net_comments: afterLabel('Comments'),
-        shares: afterLabel('Shares'), net_saves: afterLabel('Saves'), new_follows: afterLabel('Follows')
-      });
-    })()'''
-    out, err, rc = evaluate(session, extract_js, timeout=45)
-    if rc:
-        raise RuntimeError("读取跨发帖 Instagram 指标失败: {}".format(err or out))
-    metrics = json.loads(out)
-    if exact_views is not None:
-        metrics["views"] = exact_views
-    if metrics.get("views") is None or metrics.get("net_reactions") is None:
-        raise RuntimeError("跨发帖 Instagram 页面未返回必要指标: {}".format(metrics))
-    return {key: value for key, value in metrics.items() if value is not None}
+        raise RuntimeError("调用 object_insights GraphQL 失败: {}".format(err or out))
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("object_insights 返回值无法解析: {}".format(out[:200])) from error
+    diagnostics = {
+        "ok": bool(data.get("ok")),
+        "entity_type": data.get("entity_type"),
+        "views_unavailable": bool(data.get("views_unavailable")),
+        "got_keys": list(data.get("got_keys") or []),
+        "got_count": int(data.get("got_count") or 0),
+        "error": data.get("error"),
+    }
+    if not data["ok"]:
+        raise RuntimeError("object_insights 未返回 Instagram 指标: {}".format(diagnostics["error"] or data))
+    # 全字段返回（含 None）。调用方需要把 None 显式清掉，避免 IG 单值字段保留
+    # Content 表格的 FB+IG 合并值。
+    ig = dict(data.get("ig") or {})
+    return ig, diagnostics
 
 
-def enrich_cross_post_metrics(session, account, rows):
-    """依据 Published posts 响应的 cross_post 字段决定是否访问 object_insights。
+def enrich_cross_post_metrics(session, rows):
+    """跨发布帖改用 object_insights 背后的 GraphQL 取 IG 单独指标。
 
-    普通 IG 帖子完全使用 Content 表格已返回的 IG 指标；只有明确带跨发布关联的
-    帖子才进入 object_insights，读取 Instagram 标签的专属数值。
+    普通 IG 帖子完全使用 Content 表格返回的值（本身已是 IG 单值）；只有明确带
+    跨发布关联的帖子才额外发一次请求。
+
+    关键的"调用失败"判定（明确 vs 业务数据缺失）：
+      - 探针拿不到任何 IG 字段（network/auth 中断）→ 回退 Content 表格指标；
+      - 探针成功但 view 字段 TofuErrorQueryResult（Meta 老帖数据缺失）→ 视为成功，
+        用 IG 单值字段覆盖 row['metrics']，views 字段清空（绝不沿用 Content 的合
+        并值，否则会把 86,232 这种合并数当 IG 单值写入 Doris）。
     """
     if not rows:
         return
@@ -287,29 +256,47 @@ def enrich_cross_post_metrics(session, account, rows):
     for row in rows:
         if row not in cross_rows:
             row["ig_metrics_source"] = "content_table_ig_only"
-    print("  Published posts 预判：{} 条普通 IG 帖子直接用 Content 表格；{} 条跨发布帖进入 object_insights。".format(len(rows) - len(cross_rows), len(cross_rows)))
+    print("  Published posts 预判：{} 条普通 IG 帖子直接用 Content 表格；{} 条跨发布帖改用 object_insights GraphQL。".format(len(rows) - len(cross_rows), len(cross_rows)))
     for index, row in enumerate(cross_rows, 1):
-        metrics = fetch_cross_post_ig_metrics(session, account, row["row_id"])
-        if metrics is None:
-            # object_insights 已按 30 秒间隔刷新重试 3 次，仍无 Instagram 分拆时，
-            # 按业务约定回退 Published posts Content 表格的原始指标。
-            row["ig_metrics_source"] = "content_table_fallback_after_ig_split_retry"
-            print("    [{}/{}] {}: 重试后仍无 Instagram 分拆，回退 Content 表格指标".format(index, len(cross_rows), row["row_id"]), file=sys.stderr)
+        try:
+            ig, diagnostics = fetch_ig_only_metrics(session, row["row_id"])
+        except Exception as error:
+            ig = None
+            diagnostics = None
+            print("    [{}/{}] {}: 调用失败（{}）".format(index, len(cross_rows), row["row_id"], error), file=sys.stderr, flush=True)
+        if ig is None:
+            # 整次探针失败（网络/会话/GraphQL errors），按业务约定回退 Content 表格
+            # 合并指标，并标记来源；这里不能识别为跨发布后清洗，因为回退值就是合
+            # 并的，标记为 fallback 让上层链路可观测。
+            row["ig_metrics_source"] = "content_table_fallback_after_api_failure"
+            print("    [{}/{}] {}: 回退 Content 表格指标".format(index, len(cross_rows), row["row_id"]), file=sys.stderr, flush=True)
             continue
-        row["metrics"] = {key: None for key in row.get("metrics", {})}
-        row["metrics"].update(metrics)
-        row["ig_metrics_source"] = "object_insights_instagram_tab"
-        print("    [{}/{}] {}: views={}，likes_reactions={}".format(index, len(cross_rows), row["row_id"], metrics.get("views"), metrics.get("net_reactions")))
+        # 拿到 IG 单值（部分字段可能为 None）。先把 row['metrics'] 中所有 Content
+        # 合并值清掉，再用 IG 单值覆盖；None 字段保持 None，避免 FB+IG 合并值残留。
+        if row.get("metrics"):
+            for key in list(row["metrics"]):
+                row["metrics"][key] = None
+        for key, value in ig.items():
+            row.setdefault("metrics", {})[key] = value
+        row["ig_metrics_source"] = "object_insights_api_ig_only"
+        if diagnostics and diagnostics.get("views_unavailable"):
+            row["ig_metrics_views_unavailable"] = True
+            print("    [{}/{}] {}: views 业务无数据（Meta 老帖常见），其他 IG 字段已取到：got={}，reach={}，interaction={}，net_reactions={}".format(
+                index, len(cross_rows), row["row_id"], diagnostics["got_keys"],
+                ig.get("reach"), ig.get("interactions"), ig.get("net_reactions")), flush=True)
+        else:
+            print("    [{}/{}] {}: views={}，net_reactions={}，new_follows={}".format(
+                index, len(cross_rows), row["row_id"], ig.get("views"), ig.get("net_reactions"), ig.get("new_follows")), flush=True)
 
 
 def value(metrics, key, divisor=1):
     raw = metrics.get(key)
     if raw in (None, ""):
-        return 0
+        return None  # 数据缺失（Meta 老帖 views 业务无数据常见）写 NULL，不写 0
     try:
         return float(raw) / divisor if divisor != 1 else raw
     except (TypeError, ValueError):
-        return 0
+        return None
 
 
 def map_post_type(source_row):
@@ -454,6 +441,7 @@ def main():
     parser.add_argument("--session", default="dqg7tk9s", help="项目已连接的 OpenCLI 浏览器 session")
     parser.add_argument("--accounts", default="anycubicofficial,anycubic_deutschland", help="可选账号列表")
     parser.add_argument("--doris-config", default=str(DORIS_CONFIG), help="Doris 连接配置路径（credentials.ini）")
+    parser.add_argument("--dry-run", action="store_true", help="只抓取并打印结果，不写入 Doris")
     args = parser.parse_args()
     start_date, end_date = parse_dates(args)
     selected = {x.strip() for x in args.accounts.split(",") if x.strip()}
@@ -475,7 +463,7 @@ def main():
             run_windowed_fetch(args.session, start_date, end_date, account["asset_id"])
             wait_for_fetch(args.session)
             rows, report = read_rows(args.session)
-            enrich_cross_post_metrics(args.session, account, rows)
+            enrich_cross_post_metrics(args.session, rows)
             account_doris_rows = [to_doris_row(row, account, etl_date) for row in rows]
             all_doris_rows.extend(account_doris_rows)
             print("  完成：{} 条 IG 帖子/Story，GraphQL 请求 {} 次，拒绝 {} 条非 IG 记录".format(len(rows), report.get("requests", 0), report.get("rejected", 0)))
@@ -487,10 +475,24 @@ def main():
     loaded_total = 0
     if all_doris_rows:
         all_doris_rows.sort(key=lambda row: (row["account_username"], row["publish_time"]), reverse=True)
-        result = stream_load_rows(all_doris_rows, Path(args.doris_config))
-        loaded_total = int(result.get("NumberLoadedRows", 0))
-        print("\n已写入 Doris(ods_instagram_post_insights): {} 行，filtered={}，unselected={}".format(
-            loaded_total, result.get("NumberFilteredRows", 0), result.get("NumberUnselectedRows", 0)))
+        if args.dry_run:
+            print("\n[dry-run] 跳过 Doris 写入，共 {} 行：".format(len(all_doris_rows)))
+            # dry-run 在 Windows Python 默认 GBK stdout 下，打印字典会因字符触发编码错。
+            # 改为写到临时 utf-8 文件，并在 stdout 概要展示，避免 emoji/CJK 抛错。
+            preview = sorted(all_doris_rows, key=lambda r: (r.get("account_username") or "", r.get("publish_time") or ""), reverse=True)[:5]
+            print("  前 5 行预览：")
+            for row in preview:
+                print("    " + json.dumps(row, ensure_ascii=False))
+            dump_path = Path(args.doris_config).parent / "dry_run_dump.json"
+            dump_path.write_text(
+                "\n".join(json.dumps(row, ensure_ascii=False) for row in all_doris_rows),
+                encoding="utf-8")
+            print("  全量数据已写入临时文件: {}".format(dump_path))
+        else:
+            result = stream_load_rows(all_doris_rows, Path(args.doris_config))
+            loaded_total = int(result.get("NumberLoadedRows", 0))
+            print("\n已写入 Doris(ods_instagram_post_insights): {} 行，filtered={}，unselected={}".format(
+                loaded_total, result.get("NumberFilteredRows", 0), result.get("NumberUnselectedRows", 0)))
     else:
         print("\n无数据可写入 Doris")
 
@@ -501,4 +503,9 @@ def main():
 
 
 if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
     sys.exit(main())
