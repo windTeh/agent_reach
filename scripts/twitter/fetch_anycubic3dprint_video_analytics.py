@@ -155,15 +155,14 @@ def switch_to_delegate(session, tab, username):
 
 
 # ---------------------------------------------------------------- 日期工具
-def ordinal(n):
-    if 11 <= n % 100 <= 13:
-        return 'th'
-    return {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')
-
-
 def day_aria(d):
-    """按钮 aria-label 后缀, e.g. 'May 29th, 2026'（完整为 'Friday, May 29th, 2026'）"""
-    return '%s %d%s, %d' % (MONTHS_EN[d.month - 1], d.day, ordinal(d.day), d.year)
+    """按钮 aria-label 匹配片段。
+
+    X 新版日期选择器日期按钮 aria-label 为完整格式
+    'Thursday, October 1, 2026'（带星期前缀、无 st/nd/rd/th 序数）。
+    用「Month D, YYYY」片段做 indexOf 匹配即可兼容新旧两种格式。
+    """
+    return '%s %d, %d' % (MONTHS_EN[d.month - 1], d.day, d.year)
 
 
 def month_label(d):
@@ -195,39 +194,68 @@ def build_date_windows(start_date, end_date, window_days):
 
 
 # ---------------------------------------------------------------- 页面操作
+def dialog_rendered(session, tab):
+    """弹窗真正渲染（日历里含 ', 2026' 日期按钮）。
+
+    注意：role=dialog 的空壳节点会在弹窗关闭后残留，仅判存在会误判。
+    """
+    return ev(session, tab,
+              '(function(){var d=document.querySelector("[role=dialog]");'
+              'if(!d)return false;'
+              'return Array.from(d.querySelectorAll("button[aria-label]"))'
+              '.some(function(b){return (b.getAttribute("aria-label")||"")'
+              '.indexOf(", 2026")>-1})})()') is True
+
+
 def dialog_open(session, tab):
-    return ev(session, tab, '!!document.querySelector("[role=dialog]")') is True
+    return dialog_rendered(session, tab)
 
 
 def open_picker(session, tab):
-    """点击 'Select date range' 按钮并等待日历弹出。"""
+    """点击 'Select date range' 按钮并等待日历真正渲染。"""
     ev(session, tab,
        '(function(){var b=Array.from(document.querySelectorAll("[aria-label]"))'
        '.filter(function(e){return e.getAttribute("aria-label")==="Select date range"})[0];'
        'if(b){b.click();return 1}return 0})()')
     for _ in range(10):
         time.sleep(1.5)
-        if dialog_open(session, tab):
+        if dialog_rendered(session, tab):
             return True
     return False
 
 
 def month_visible(session, tab, label):
+    """判断目标月份是否可见。
+
+    注意：新版 X 日期选择器月份标题按钮的 aria-label 是 'January 2022'
+    这种带空格的格式，而 innerText 中月份名与年份被换行符分隔
+    （'January\n2022'），用 innerText.indexOf 会匹配失败导致死循环翻页。
+    故改用月份标题按钮的 aria-label 精确匹配。
+    """
     return ev(session, tab,
               '(function(){var d=document.querySelector("[role=dialog]");'
-              'return !!d && d.innerText.indexOf("%s")>-1})()' % label) is True
+              'if(!d)return false;'
+              'var m=d.querySelector("button[aria-haspopup=menu]");'
+              'return !!m && (m.getAttribute("aria-label")||"")==="%s"})()' % label) is True
 
 
 def nav_until(session, tab, label, direction, max_clicks=24):
-    """点击 Previous/Next 月导航直到目标月份可见。"""
+    """点击 Previous/Next 月导航直到目标月份可见。
+
+    X 新版月份导航按钮 aria-label 为 'Previous month' / 'Next month'
+    （旧版为 'Go to the Previous Month' / 'Go to the Next Month'）。
+    """
+    prev_aria = {'prev': 'Previous month', 'next': 'Next month'}[direction]
     for _ in range(max_clicks):
         if month_visible(session, tab, label):
             return True
         ev(session, tab,
            '(function(){var d=document.querySelector("[role=dialog]");if(!d)return;'
            'var b=Array.from(d.querySelectorAll("button")).find(function(x)'
-           '{return x.getAttribute("aria-label")==="Go to the %s Month"});'
-           'if(b){b.click()}})()' % ('Previous' if direction == 'prev' else 'Next'))
+           '{var a=x.getAttribute("aria-label")||"";'
+           'return a==="%s"||a==="Go to the %s Month"});'
+           'if(b){b.click()}})()' % (prev_aria,
+                                    'Previous' if direction == 'prev' else 'Next'))
         time.sleep(1.2)
     return month_visible(session, tab, label)
 
@@ -243,10 +271,18 @@ def click_date(session, tab, d):
 
 
 def close_dialog(session, tab):
+    """关闭日期弹窗：优先 toggle 'Select date range' 按钮，Escape 兜底。"""
     ev(session, tab,
-       '(function(){document.dispatchEvent(new KeyboardEvent("keydown",'
-       '{key:"Escape",code:"Escape"}));return 1})()')
+       '(function(){var b=Array.from(document.querySelectorAll("[aria-label]"))'
+       '.filter(function(e){return e.getAttribute("aria-label")==='
+       '"Select date range"})[0];'
+       'if(b&&b.getAttribute("aria-expanded")==="true"){b.click();return 1}return 0})()')
     time.sleep(2)
+    if dialog_rendered(session, tab):
+        ev(session, tab,
+           '(function(){document.dispatchEvent(new KeyboardEvent("keydown",'
+           '{key:"Escape",code:"Escape"}));return 1})()')
+        time.sleep(2)
 
 
 def page_has_error(session, tab):
@@ -254,6 +290,20 @@ def page_has_error(session, tab):
                  '(function(){var m=document.querySelector("[data-testid=primaryColumn]");'
                  'return m?m.innerText.slice(0,200):""})()'))
     return 'Something went wrong' in txt
+
+
+def recover_page_error(session, tab, max_retry=6):
+    """X 的分析查询会间歇性失败（瞬态 Something went wrong，与范围大小
+    无关），点 Retry 重试同一查询直到恢复。"""
+    for _ in range(max_retry):
+        if not page_has_error(session, tab):
+            return True
+        ev(session, tab,
+           '(function(){var bs=Array.from(document.querySelectorAll("button"));'
+           'var b=bs.find(function(x){return /Retry/i.test(x.textContent||"")});'
+           'if(b){b.click();return 1}return 0})()')
+        time.sleep(8)
+    return not page_has_error(session, tab)
 
 
 def reset_range_7d(session, tab):
@@ -272,30 +322,30 @@ def reset_range_7d(session, tab):
 
 
 def select_range(session, tab, start, end):
-    """在日期选择器上选定覆盖 [start, end] 的范围。
+    """在日期选择器上选定 [start, end]（新版 X 日历，2026-10 验证）。
 
-    实际点击的起点是 start - 30 天（lead），保证起点落在 7D 选区之外；
-    mediaMetricsQuery 会再把请求范围自动前移约一个窗口长度，返回数据点
+    新版交互（须先经 reset_range_7d 重置为 7D）：
+      1. 弹窗打开后日历显示 Start 所在月；
+      2. 点第一个日期 -> 设为 Start（End 自动变为原 Start）；
+      3. 点第二个日期 -> 设为 End，选区完成；
+      4. 日历月份标题按钮 aria-label 即 'October 2026'（带空格）；
+      5. 日期按钮 aria-label 为 'Thursday, October 1, 2026'（带星期前缀）。
+
+    mediaMetricsQuery 会把请求范围自动前移约一个窗口长度，返回数据点
     必然覆盖 [start, end]，解析后裁剪即可。
     """
     if not open_picker(session, tab):
         return 'picker open failed'
-    clicked = False
-    for lead_days in (30, 14, 7, 0):
-        lead = start - timedelta(days=lead_days)
-        if not nav_until(session, tab, month_label(lead), 'prev'):
-            continue  # 太早无法翻页，缩小前移量重试
-        r = click_date(session, tab, lead)
-        if 'clicked' in str(r):
-            clicked = True
-            break
-    if not clicked:
-        return 'start click failed'
+    # 翻到 start 所在月（日历初始在 7D Start 的月份，通常 >= start，向 prev 翻）
+    if not nav_until(session, tab, month_label(start), 'prev'):
+        if not nav_until(session, tab, month_label(start), 'next'):
+            return 'nav to start month failed'
+    r = click_date(session, tab, start)
+    if 'clicked' not in str(r):
+        return 'start click failed: %s' % r
     time.sleep(2)
-    # 有些情况下点击 start 后日历会自动关闭 -> 重新打开
-    if not dialog_open(session, tab):
-        if not open_picker(session, tab):
-            return 'picker reopen failed'
+    if not dialog_rendered(session, tab):
+        return 'dialog closed after start click'
     # 翻到 end 所在月
     if not nav_until(session, tab, month_label(end), 'next'):
         return 'nav to end month failed'
@@ -306,7 +356,9 @@ def select_range(session, tab, start, end):
     for _ in range(8):
         time.sleep(3)
         if page_has_error(session, tab):
-            return 'page error (range may exceed X limit)'
+            if recover_page_error(session, tab):
+                break
+            return 'page error (query failed)'
         txt = str(ev(session, tab,
                      '(function(){var m=document.querySelector("[data-testid=primaryColumn]");'
                      'return m?m.innerText.slice(0,150):""})()'))
@@ -430,12 +482,7 @@ def fetch_window(session, tab, start, end, attempts=3):
     """
     for i in range(attempts):
         if page_has_error(session, tab):
-            close_dialog(session, tab)
-            ev(session, tab,
-               '(function(){var bs=Array.from(document.querySelectorAll("button"));'
-               'var b=bs.find(function(x){return /Retry/i.test(x.textContent||"")});'
-               'if(b){b.click();return 1}return 0})()')
-            time.sleep(10)
+            recover_page_error(session, tab)
         reset_range_7d(session, tab)
         clear_mmq(session, tab)
         status = select_range(session, tab, start, end)

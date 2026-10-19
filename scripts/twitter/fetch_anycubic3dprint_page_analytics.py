@@ -160,8 +160,13 @@ def ordinal(n):
 
 
 def day_aria(d):
-    """按钮 aria-label 后缀, e.g. 'May 29th, 2026'（完整为 'Friday, May 29th, 2026'）"""
-    return '%s %d%s, %d' % (MONTHS_EN[d.month - 1], d.day, ordinal(d.day), d.year)
+    """按钮 aria-label 匹配片段。
+
+    X 新版日期选择器日期按钮 aria-label 为完整格式
+    'Thursday, October 1, 2026'（带星期前缀、无 st/nd/rd/th 序数）。
+    用「Month D, YYYY」片段做 indexOf 匹配即可兼容新旧两种格式。
+    """
+    return '%s %d, %d' % (MONTHS_EN[d.month - 1], d.day, d.year)
 
 
 def month_label(d):
@@ -193,39 +198,68 @@ def build_date_windows(start_date, end_date, window_days):
 
 
 # ---------------------------------------------------------------- 页面操作
+def dialog_rendered(session, tab):
+    """弹窗真正渲染（日历里含 ', 2026' 日期按钮）。
+
+    注意：role=dialog 的空壳节点会在弹窗关闭后残留，仅判存在会误判。
+    """
+    return ev(session, tab,
+              '(function(){var d=document.querySelector("[role=dialog]");'
+              'if(!d)return false;'
+              'return Array.from(d.querySelectorAll("button[aria-label]"))'
+              '.some(function(b){return (b.getAttribute("aria-label")||"")'
+              '.indexOf(", 2026")>-1})})()') is True
+
+
 def dialog_open(session, tab):
-    return ev(session, tab, '!!document.querySelector("[role=dialog]")') is True
+    return dialog_rendered(session, tab)
 
 
 def open_picker(session, tab):
-    """点击 'Select date range' 按钮并等待日历弹出。"""
+    """点击 'Select date range' 按钮并等待日历真正渲染。"""
     ev(session, tab,
        '(function(){var b=Array.from(document.querySelectorAll("[aria-label]"))'
        '.filter(function(e){return e.getAttribute("aria-label")==="Select date range"})[0];'
        'if(b){b.click();return 1}return 0})()')
     for _ in range(10):
         time.sleep(1.5)
-        if dialog_open(session, tab):
+        if dialog_rendered(session, tab):
             return True
     return False
 
 
 def month_visible(session, tab, label):
+    """判断目标月份是否可见。
+
+    注意：新版 X 日期选择器月份标题按钮的 aria-label 是 'January 2022'
+    这种带空格的格式，而 innerText 中月份名与年份被换行符分隔
+    （'January\n2022'），用 innerText.indexOf 会匹配失败导致死循环翻页。
+    故改用月份标题按钮的 aria-label 精确匹配。
+    """
     return ev(session, tab,
               '(function(){var d=document.querySelector("[role=dialog]");'
-              'return !!d && d.innerText.indexOf("%s")>-1})()' % label) is True
+              'if(!d)return false;'
+              'var m=d.querySelector("button[aria-haspopup=menu]");'
+              'return !!m && (m.getAttribute("aria-label")||"")==="%s"})()' % label) is True
 
 
 def nav_until(session, tab, label, direction, max_clicks=24):
-    """点击 Previous/Next 月导航直到目标月份可见。"""
+    """点击 Previous/Next 月导航直到目标月份可见。
+
+    X 新版月份导航按钮 aria-label 为 'Previous month' / 'Next month'
+    （旧版为 'Go to the Previous Month' / 'Go to the Next Month'）。
+    """
+    prev_aria = {'prev': 'Previous month', 'next': 'Next month'}[direction]
     for _ in range(max_clicks):
         if month_visible(session, tab, label):
             return True
         ev(session, tab,
            '(function(){var d=document.querySelector("[role=dialog]");if(!d)return;'
            'var b=Array.from(d.querySelectorAll("button")).find(function(x)'
-           '{return x.getAttribute("aria-label")==="Go to the %s Month"});'
-           'if(b){b.click()}})()' % ('Previous' if direction == 'prev' else 'Next'))
+           '{var a=x.getAttribute("aria-label")||"";'
+           'return a==="%s"||a==="Go to the %s Month"});'
+           'if(b){b.click()}})()' % (prev_aria,
+                                    'Previous' if direction == 'prev' else 'Next'))
         time.sleep(1.2)
     return month_visible(session, tab, label)
 
@@ -241,10 +275,18 @@ def click_date(session, tab, d):
 
 
 def close_dialog(session, tab):
+    """关闭日期弹窗：优先 toggle 'Select date range' 按钮，Escape 兜底。"""
     ev(session, tab,
-       '(function(){document.dispatchEvent(new KeyboardEvent("keydown",'
-       '{key:"Escape",code:"Escape"}));return 1})()')
+       '(function(){var b=Array.from(document.querySelectorAll("[aria-label]"))'
+       '.filter(function(e){return e.getAttribute("aria-label")==='
+       '"Select date range"})[0];'
+       'if(b&&b.getAttribute("aria-expanded")==="true"){b.click();return 1}return 0})()')
     time.sleep(2)
+    if dialog_rendered(session, tab):
+        ev(session, tab,
+           '(function(){document.dispatchEvent(new KeyboardEvent("keydown",'
+           '{key:"Escape",code:"Escape"}));return 1})()')
+        time.sleep(2)
 
 
 def page_has_error(session, tab):
@@ -252,6 +294,20 @@ def page_has_error(session, tab):
                  '(function(){var m=document.querySelector("[data-testid=primaryColumn]");'
                  'return m?m.innerText.slice(0,200):""})()'))
     return 'Something went wrong' in txt
+
+
+def recover_page_error(session, tab, max_retry=6):
+    """X 的 accountOverviewDailyQuery 会间歇性失败（瞬态 Something went
+    wrong，与范围大小无关），点 Retry 重试同一查询直到恢复。"""
+    for _ in range(max_retry):
+        if not page_has_error(session, tab):
+            return True
+        ev(session, tab,
+           '(function(){var bs=Array.from(document.querySelectorAll("button"));'
+           'var b=bs.find(function(x){return /Retry/i.test(x.textContent||"")});'
+           'if(b){b.click();return 1}return 0})()')
+        time.sleep(8)
+    return not page_has_error(session, tab)
 
 
 def reset_range_7d(session, tab):
@@ -270,29 +326,28 @@ def reset_range_7d(session, tab):
 
 
 def select_range(session, tab, start, end):
-    """在日期选择器上选定覆盖 [start, end] 的范围。
+    """在日期选择器上选定 [start, end]（新版 X 日历，2026-10 验证）。
 
-    注意：实际点击的起点是 start - 30 天（lead），保证一定在 7D 选区之外
-    （start <= 今天，故 lead <= 今天-30 < 今天-6）；CSV 解析后再裁剪。
+    新版交互（须先经 reset_range_7d 重置为 7D）：
+      1. 弹窗打开后日历显示 Start 所在月；
+      2. 点第一个日期 -> 设为 Start（End 自动变为原 Start）；
+      3. 点第二个日期 -> 设为 End，选区完成；
+      4. 日历月份标题按钮 aria-label 即 'October 2026'（带空格）；
+      5. 日期按钮 aria-label 为 'Thursday, October 1, 2026'（带星期前缀）。
     """
     if not open_picker(session, tab):
         return 'picker open failed'
-    clicked = False
-    for lead_days in (30, 14, 7, 0):
-        lead = start - timedelta(days=lead_days)
-        if not nav_until(session, tab, month_label(lead), 'prev'):
-            continue  # 太早无法翻页，缩小前移量重试
-        r = click_date(session, tab, lead)
-        if 'clicked' in str(r):
-            clicked = True
-            break
-    if not clicked:
-        return 'start click failed'
+    # 翻到 start 所在月（日历初始在 7D Start 的月份，通常 >= start，向 prev 翻）
+    if not nav_until(session, tab, month_label(start), 'prev'):
+        # 兜底：向 next 翻
+        if not nav_until(session, tab, month_label(start), 'next'):
+            return 'nav to start month failed'
+    r = click_date(session, tab, start)
+    if 'clicked' not in str(r):
+        return 'start click failed: %s' % r
     time.sleep(2)
-    # 有些情况下点击 start 后日历会自动关闭 -> 重新打开
-    if not dialog_open(session, tab):
-        if not open_picker(session, tab):
-            return 'picker reopen failed'
+    if not dialog_rendered(session, tab):
+        return 'dialog closed after start click'
     # 翻到 end 所在月
     if not nav_until(session, tab, month_label(end), 'next'):
         return 'nav to end month failed'
@@ -300,16 +355,10 @@ def select_range(session, tab, start, end):
     if 'clicked' not in str(r):
         return 'end click failed: %s' % r
     time.sleep(3)
-    # 等待 accountOverviewDailyQuery 完成、页面重渲染
-    for _ in range(6):
-        time.sleep(3)
-        if page_has_error(session, tab):
-            return 'page error (range may exceed X limit)'
-        txt = str(ev(session, tab,
-                     '(function(){var m=document.querySelector("[data-testid=primaryColumn]");'
-                     'return m?m.innerText.slice(0,150):""})()'))
-        if 'Account overview' in txt or 'Follows over time' in txt:
-            break
+    close_dialog(session, tab)
+    # 等待 accountOverviewDailyQuery 完成（瞬态错误自动 Retry）
+    if not recover_page_error(session, tab):
+        return 'page error after range apply'
     return 'ok'
 
 
@@ -338,25 +387,21 @@ def download_csv(session, tab):
 def fetch_window(session, tab, start, end, attempts=3):
     """抓取一个日期窗口的账号级日度 CSV，带重试。
 
-    选择器实际选的范围是 [start-30天, end]（lead），解析后裁剪回 [start, end]。
+    新版流程：reset_range_7d 重置选区 -> select_range 点选 [start, end] ->
+    Download CSV 内存截获 -> 解析校验。
     """
     for i in range(attempts):
         if page_has_error(session, tab):
-            close_dialog(session, tab)
-            ev(session, tab,
-               '(function(){var bs=Array.from(document.querySelectorAll("button"));'
-               'var b=bs.find(function(x){return /Retry/i.test(x.textContent||"")});'
-               'if(b){b.click();return 1}return 0})()')
-            time.sleep(10)
+            recover_page_error(session, tab)
         reset_range_7d(session, tab)
         status = select_range(session, tab, start, end)
         if status != 'ok':
             print(f'    range select: {status}', end=' ')
+            time.sleep(5)
             continue
-        close_dialog(session, tab)
         csv_text = download_csv(session, tab)
         rows = parse_csv(csv_text)
-        # 裁剪回目标窗口
+        # 只保留目标窗口内的日期
         rows = {d: r for d, r in rows.items() if start <= d <= end}
         if rows and validate_rows(rows, start, end):
             return rows
