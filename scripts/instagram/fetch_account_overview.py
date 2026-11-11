@@ -282,7 +282,8 @@ def set_date_range_ui(session, start_date, end_date):
     return false;
   }
 
-  // ── 翻到目标月：左面板为起始月 ──
+  // ── 翻到目标月：让左面板月份 = 目标月（双向翻月）──
+  //   双月视图左面板显示起始月；目标月可能在左面板（往前翻）或右面板（往后翻）
   async function navigateTo(targetYM) {
     let safety = 60;
     while (safety-- > 0) {
@@ -290,8 +291,12 @@ def set_date_range_ui(session, start_date, end_date):
       if (!v.length) break;
       const leftYM = toYM(v[0]);
       if (leftYM == null) break;
-      if (leftYM <= targetYM) break;
-      if (!clickPrev()) break;
+      if (leftYM === targetYM) break;              // 左面板已对准目标月
+      if (leftYM > targetYM) {
+        if (!clickPrev()) break;                    // 目标月在前，往前翻
+      } else {
+        if (!clickNext()) break;                    // 目标月在后，往后翻
+      }
       await sleep(300);
     }
   }
