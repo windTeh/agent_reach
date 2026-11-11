@@ -408,59 +408,67 @@ def extract_metrics_from_dom(session):
   results._meta = results._meta || {};
   results._meta.timezone = tz;
 
-  // 3. 找时间戳行（全文唯一一组，所有指标共享）
-  const tsMatch = text.match(/(\d{10}(?:\t\d{10})+)/);
-  if (!tsMatch) return JSON.stringify({_meta: {...results._meta, error: 'no timestamps'}});
-  const timestamps = tsMatch[1].split('\t').map(t => parseInt(t));
-
-  // 4. 用账户 TZ 把时间戳转为日期字符串（YYYY-MM-DD）
+  // 3. 用账户 TZ 把时间戳转为日期字符串（YYYY-MM-DD）
   const fmt = new Intl.DateTimeFormat('en-CA', {
     timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
   });
-  results._dates = timestamps.map(ts => {
+  function tsToDate(ts) {
     const d = new Date(ts * 1000);
     const parts = fmt.formatToParts(d);
     const y = parts.find(p => p.type === 'year').value;
     const m = parts.find(p => p.type === 'month').value;
     const day = parts.find(p => p.type === 'day').value;
     return `${y}-${m}-${day}`;
-  });
+  }
 
-  // 5. 指标定义
+  // 4. 指标定义
   // Results 页面账号级指标实际显示名（按页面 innerText 顺序）：
-  //   Views / Viewers(=Reach) / Content interactions / Link clicks / Visits / Follows
+  //   Views / Reach(=Viewers) / Content interactions / Link clicks / Visits / Follows
   //   注意：Results 页面不展示 Unfollows（需到 Audience 子页或 Graph API 才有）
-  //   anchor 用「主标题」（出现在 Primary 数据行之前），不用 "Facebook xxx" 描述文字
-  //   （描述文字在 Primary 之后，作为 anchor 会错过数据行）
+  //   anchor 用「主标题」（出现在 Primary 数据行之前），不用 "Instagram xxx" 描述文字
+  //   （描述文字是上一个指标块的内容，作为 anchor 会定位错块）
   const metrics = [
-    {name: 'views', patterns: ['Views']},
-    {name: 'reach', patterns: ['Viewers', 'Reach']},
-    {name: 'content_interactions', patterns: ['Content interactions']},
-    {name: 'follows', patterns: ['Follows']},
-    {name: 'unfollows', patterns: ['Unfollows']},
-    {name: 'profile_visits', patterns: ['Visits', 'Profile visits']},
-    {name: 'link_clicks', patterns: ['Link clicks']},
+    {name: 'views', patterns: ['\nViews\n']},
+    {name: 'reach', patterns: ['\nReach\n', '\nViewers\n']},
+    {name: 'content_interactions', patterns: ['\nContent interactions\n']},
+    {name: 'follows', patterns: ['\nFollows\n']},
+    {name: 'unfollows', patterns: ['\nUnfollows\n']},
+    {name: 'profile_visits', patterns: ['\nVisits\n', '\nProfile visits\n']},
+    {name: 'link_clicks', patterns: ['\nLink clicks\n']},
   ];
 
-  // 6. 位置锚定提取：每个 metric 在自身窗口内找 Primary 数据
-  //    2000 字符足够覆盖一个 metric chart 块，且不会跨入下一个 metric
-  const MAX_LOOKAHEAD = 2000;
+  // 5. 每个指标块独立解析：块内自带时间戳行 + Primary 数值行，天然等长，
+  //    彻底消除「日期切换后 React 重渲染竞态」导致的 values.length !== timestamps.length 丢弃问题。
+  //    块结构（innerText）：
+  //      <主标题>
+  //      <零宽空格/Export/汇总值/百分比/日期轴刻度/y轴刻度>
+  //      <时间戳行: 1791874800\t1791961200\t...>
+  //      Primary\t<数值>\t<数值>...
+  const MAX_LOOKAHEAD = 6000;
   for (const metric of metrics) {
-    let matched = false;
     for (const pattern of metric.patterns) {
       const idx = text.indexOf(pattern);
       if (idx === -1) continue;
       const window = text.slice(idx, idx + MAX_LOOKAHEAD);
+      // 块内时间戳行（标题后最近的一组连续 10 位时间戳）
+      const tsBlock = window.match(/(\d{10}(?:\t\d{10})+)/);
+      if (!tsBlock) continue;
+      const tsArr = tsBlock[1].split('\t').map(t => parseInt(t));
+      // Primary 数值行（块内第一个 Primary 行）
       const primaryMatch = window.match(/Primary\t([\d.]+(?:\t[\d.]+)*)/);
       if (!primaryMatch) continue;
       const values = primaryMatch[1].split('\t').map(v => parseFloat(v.replace(/,/g, '')));
-      if (values.length !== timestamps.length) continue;
+      // 数值数量必须与块内时间戳数量一致（同图表数据，理应等长；不等长说明块解析错位，跳过该 pattern）
+      if (values.length !== tsArr.length) continue;
       const dailyData = {};
       for (let i = 0; i < values.length; i++) {
-        dailyData[results._dates[i]] = values[i];
+        dailyData[tsToDate(tsArr[i])] = values[i];
       }
       results[metric.name] = dailyData;
-      matched = true;
+      // 记录全局日期（取第一个成功指标的日期序列，供 merge 阶段兜底）
+      if (!results._dates.length) {
+        results._dates = tsArr.map(tsToDate);
+      }
       break;
     }
   }
@@ -716,10 +724,20 @@ def fetch_account_overview(session, account, start_date, end_date):
     # 4. 注入账户时区（必须在 extract 之前，否则 fallback 到默认 PT）
     set_account_timezone(session, tz)
 
-    # 5. 从 DOM 提取数据
+    # 5. 从 DOM 提取数据（轮询等待 React 重渲染稳定，避免竞态导致指标缺失）
     print("从页面提取指标数据...")
-    time.sleep(3)  # 等 React 重渲染完成
-    dom_data = extract_metrics_from_dom(session)
+    dom_data = {}
+    for attempt in range(6):
+        time.sleep(2)
+        dom_data = extract_metrics_from_dom(session)
+        meta = dom_data.get('_meta', {})
+        found = meta.get('metricsFound', 0)
+        if found >= 6:
+            print(f"  渲染稳定，提取到 {found} 个指标（第 {attempt + 1} 次尝试）")
+            break
+        print(f"  第 {attempt + 1} 次提取到 {found} 个指标，等待重渲染...")
+    else:
+        print("  ⚠️ 渲染仍不稳定，使用最后一次提取结果")
 
     meta = dom_data.pop('_meta', {})
     available_dates = dom_data.pop('_dates', [])
